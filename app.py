@@ -154,16 +154,48 @@ if uploaded_file is not None:
 if run_button:
     if st.session_state.file_bytes is not None:
         with st.spinner("Processing your paper..."):
+            
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
                 tmp_file.write(st.session_state.file_bytes)
                 tmp_file_path = tmp_file.name
+
             input_text = extract_text_from_pdf(tmp_file_path)
             processed_input = preprocess_text(input_text)
             k = st.session_state.k_value
-            tfidf_recs = recommend_with_tfidf(processed_input, k=k)
-            embedding_recs = recommend_with_embeddings(processed_input, k=k)
+            
+            # --- Get Raw Recommendations ---
+            tfidf_recs_raw = recommend_with_tfidf(processed_input, k=k+1) # Get k+1 initially
+            embedding_recs_raw = recommend_with_embeddings(processed_input, k=k+1) # Get k+1 initially
+            
             os.remove(tmp_file_path)
-            st.session_state.results = (tfidf_recs, embedding_recs)
+
+            # --- *** NEW: FILTERING LOGIC *** ---
+            # Check if the uploaded file name matches any paper in our database
+            # We use the original filename stored in session state
+            uploaded_filename = st.session_state.file_name
+            
+            # Find if this paper exists in our original dataframe
+            matching_paper = author_df[author_df['paper'] == uploaded_filename]
+            
+            author_to_exclude = None
+            if not matching_paper.empty:
+                # If it matches, get the author of that paper from our database
+                author_to_exclude = matching_paper.iloc[0]['author']
+                print(f"Uploaded paper matches dataset paper. Excluding author: {author_to_exclude}")
+
+            # Filter the recommendations if an author needs exclusion
+            if author_to_exclude:
+                tfidf_recs_filtered = tfidf_recs_raw[tfidf_recs_raw.index != author_to_exclude].head(k)
+                embedding_recs_filtered = embedding_recs_raw[embedding_recs_raw.index != author_to_exclude].head(k)
+            else:
+                # No match found, or no author to exclude, just take top k
+                tfidf_recs_filtered = tfidf_recs_raw.head(k)
+                embedding_recs_filtered = embedding_recs_raw.head(k)
+            # --- *** END OF FILTERING LOGIC *** ---
+
+            # Store the FILTERED results in session state
+            st.session_state.results = (tfidf_recs_filtered, embedding_recs_filtered)
+    
     elif st.session_state.file_bytes is None:
         st.error("Please upload a PDF file first.")
 
@@ -204,4 +236,5 @@ if st.button(f"Find Reviewers Similar to {selected_author}"):
             'Similarity Score': similar_authors.values
 
         }))
+
 
