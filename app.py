@@ -22,12 +22,10 @@ import tempfile
 
 # --- Setup Tesseract & Poppler Paths ---
 # (We still need these for processing NEWLY UPLOADED files)
-try:
-    tesseract_install_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-    pytesseract.pytesseract.tesseract_cmd = tesseract_install_path
-except Exception:
-    pass 
-poppler_install_path = r"C:\poppler\bin"
+
+tesseract_install_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+pytesseract.pytesseract.tesseract_cmd = tesseract_install_path
+poppler_install_path = r"C:\Users\VAMSHI KRISHNA BABU\poppler\poppler-25.07.0\Library\bin"
 
 # --- NLTK Setup ---
 @st.cache_data
@@ -205,4 +203,5 @@ if st.button(f"Find Reviewers Similar to {selected_author}"):
         st.dataframe(pd.DataFrame({
             'Author': similar_authors.index,
             'Similarity Score': similar_authors.values
+
         }))
