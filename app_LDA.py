@@ -16,55 +16,48 @@ from sentence_transformers import SentenceTransformer
 import joblib
 import tempfile
 
+# --- Constants for filenames ---
+AUTHOR_DB_FILE = 'author_database.parquet'
+EMBEDDINGS_FILE = 'paper_embeddings.npy'
+TFIDF_VEC_FILE = 'tfidf_vectorizer.joblib'
+TFIDF_MAT_FILE = 'tfidf_matrix.joblib'
+LDA_COUNT_VEC_FILE = 'lda_count_vectorizer.joblib'
+LDA_MODEL_FILE = 'lda_model.joblib'
+LDA_PROFILES_FILE = 'lda_author_profiles.joblib'
+ST_MODEL_CACHE_DIR = './model_cache'
+
 # -----------------------------------------------------------------
 # 1. SETUP & HELPER FUNCTIONS
 # -----------------------------------------------------------------
 
 # --- Setup Paths ---
-# Tesseract path (Needed if not in system PATH, comment out if deployed)
-# try:
-#     tesseract_install_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-#     pytesseract.pytesseract.tesseract_cmd = tesseract_install_path
-# except Exception:
-#     print("Tesseract command not set. Ensure Tesseract is in your PATH.")
-#     pass
+# Use the simplified Poppler path (ensure this exists in deployment environment if using Docker/locally)
+# For Streamlit Cloud, poppler-utils in packages.txt handles this.
+poppler_install_path = r"C:\poppler\bin" # Primarily for local Windows execution
 
-# Use the simplified Poppler path
-poppler_install_path = r"C:\Users\VAMSHI KRISHNA BABU\poppler\poppler-25.07.0\Library\bin"
-
-# --- NLTK Setup ---
 # --- NLTK Setup ---
 @st.cache_data
 def setup_nltk():
-    try:
-        # Check if resources exist, raise LookupError if not
-        nltk.data.find('corpora/stopwords')
-        print("NLTK stopwords found.")
-    except LookupError:
-        print("NLTK stopwords not found. Downloading...")
-        nltk.download('stopwords', quiet=True)
-    try:
-        nltk.data.find('tokenizers/punkt')
-        print("NLTK punkt tokenizer found.")
-    except LookupError:
-        print("NLTK punkt tokenizer not found. Downloading...")
-        nltk.download('punkt', quiet=True)
-    try:
-        # This resource might be needed by word_tokenize indirectly
-        nltk.data.find('tokenizers/punkt_tab')
-        print("NLTK punkt_tab resource found.")
-    except LookupError:
-        print("NLTK punkt_tab resource not found. Downloading...")
-        nltk.download('punkt_tab', quiet=True) # Added this download
-
+    resources = {
+        'corpora/stopwords': 'stopwords',
+        'tokenizers/punkt': 'punkt',
+        'tokenizers/punkt_tab': 'punkt_tab' # Needed for word_tokenize edge cases
+    }
+    for resource_path, download_name in resources.items():
+        try:
+            nltk.data.find(resource_path)
+            print(f"NLTK resource '{download_name}' found.")
+        except LookupError:
+            print(f"NLTK resource '{download_name}' not found. Downloading...")
+            nltk.download(download_name, quiet=True)
 setup_nltk()
 
 # --- PDF Extraction & Preprocessing (No Tika) ---
 def extract_text_from_pdf(pdf_path):
+    # (Same function as before, ensure poppler_path is correct for your environment)
     try: # PyMuPDF
         text = ""
         with fitz.open(pdf_path) as doc:
-            # Check for encryption first
             if doc.is_encrypted:
                 print(f"WARN: {os.path.basename(pdf_path)} is encrypted. Skipping.")
                 return ""
@@ -72,193 +65,243 @@ def extract_text_from_pdf(pdf_path):
         if text.strip(): return text
     except Exception as e_fitz:
         print(f"INFO: PyMuPDF failed on {os.path.basename(pdf_path)} ({e_fitz}). Trying OCR.")
-        pass # Fall through to OCR
-    try: # OCR Fallback
+        pass
+    try: # OCR
         images = convert_from_path(pdf_path, poppler_path=poppler_install_path)
-        if not images: # Handle case where pdf2image returns empty list
+        if not images:
              print(f"WARN: pdf2image couldn't convert {os.path.basename(pdf_path)}. Skipping OCR.")
              return ""
         ocr_text = ""
         for img in images:
             try:
-                ocr_text += pytesseract.image_to_string(img, lang='eng')
+                # Add timeout to Tesseract to prevent hangs
+                ocr_text += pytesseract.image_to_string(img, lang='eng', timeout=30) # 30 second timeout per page
             except pytesseract.TesseractNotFoundError:
-                 st.error("Tesseract is not installed or not in your PATH. OCR functionality will not work.")
+                 st.error("Tesseract is not installed or not in your PATH/packages.txt. OCR functionality will not work.")
                  print("ERROR: Tesseract not found during OCR.")
                  return "" # Stop processing if Tesseract isn't found
+            except RuntimeError as timeout_error:
+                 print(f"WARN: Tesseract timed out on an image from {os.path.basename(pdf_path)} ({timeout_error})")
+                 continue # Try next image
             except Exception as e_tess:
                  print(f"WARN: Tesseract failed on an image from {os.path.basename(pdf_path)} ({e_tess})")
-                 continue # Try next image
+                 continue
         if ocr_text.strip():
              print(f"INFO: Successfully extracted text using OCR for {os.path.basename(pdf_path)}")
              return ocr_text
     except Exception as e_ocr:
-        # Catch errors during pdf2image conversion itself
-        print(f"ERROR: OCR stage failed for {os.path.basename(pdf_path)} ({e_ocr}). Might be Poppler path issue or corrupted PDF.")
+        print(f"ERROR: OCR stage failed for {os.path.basename(pdf_path)} ({e_ocr}). Check Poppler/PDF corruption.")
         return ""
     print(f"WARN: Both PyMuPDF & OCR failed for {os.path.basename(pdf_path)}. Skipping.")
     return ""
 
 
 def preprocess_text(text):
-    if not isinstance(text, str): # Add check for non-string input
+    if not isinstance(text, str) or not text.strip(): # Check for non-string or empty/whitespace only
          return ""
     text = text.lower()
-    text = re.sub(r'[^a-zA-Z\s]', '', text)
+    text = re.sub(r'[^a-zA-Z\s]', '', text) # Remove non-alpha characters and spaces
     tokens = word_tokenize(text)
     stop_words = set(stopwords.words('english'))
-    filtered_tokens = [word for word in tokens if word not in stop_words]
-    # Handle case where text becomes empty after preprocessing
+    filtered_tokens = [word for word in tokens if word not in stop_words and len(word) > 1] # Remove single letters too
     return " ".join(filtered_tokens) if filtered_tokens else ""
 
 
 # -----------------------------------------------------------------
-# 2. MODEL LOADING & PREPARATION (Includes LDA)
+# 2. MODEL LOADING & PREPARATION (Enhanced Error Handling)
 # -----------------------------------------------------------------
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Loading models and data files...")
 def load_models_and_data():
-    print("Loading pre-processed files...")
-    # Load base data
-    try:
-        author_df = pd.read_parquet('author_database.parquet')
-        paper_embeddings = np.load('paper_embeddings.npy')
-    except FileNotFoundError as e:
-        st.error(f"Error loading base data ({e}). Make sure '.parquet' and '.npy' files are in the app directory.")
-        print(f"FATAL ERROR: Could not load base data files: {e}")
-        st.stop() # Stop the app if base files are missing
+    loaded_data = {}
+    required_files = [
+        AUTHOR_DB_FILE, EMBEDDINGS_FILE, TFIDF_VEC_FILE, TFIDF_MAT_FILE,
+        LDA_COUNT_VEC_FILE, LDA_MODEL_FILE, LDA_PROFILES_FILE
+    ]
+    missing_files = [f for f in required_files if not os.path.exists(f)]
 
-    # Load TF-IDF
+    if missing_files:
+        st.error(f"FATAL ERROR: Missing required data/model files: {', '.join(missing_files)}. Please ensure all pre-processed files are in the app directory.")
+        print(f"FATAL ERROR: Missing files: {missing_files}")
+        st.stop() # Stop the app if essential files are missing
+
+    # --- Load base data with explicit error handling ---
     try:
-        tfidf_vectorizer = joblib.load('tfidf_vectorizer.joblib')
-        tfidf_matrix = joblib.load('tfidf_matrix.joblib')
-    except FileNotFoundError as e:
-        st.error(f"Error loading TF-IDF models ({e}). Make sure '.joblib' files are present.")
-        print(f"FATAL ERROR: Could not load TF-IDF model files: {e}")
+        author_df = pd.read_parquet(AUTHOR_DB_FILE)
+        paper_embeddings = np.load(EMBEDDINGS_FILE)
+        # **Crucial Check:** Verify DataFrame content after loading
+        if author_df.empty:
+            st.error(f"FATAL ERROR: Loaded '{AUTHOR_DB_FILE}' but it appears to be empty.")
+            print(f"FATAL ERROR: {AUTHOR_DB_FILE} loaded empty.")
+            st.stop()
+        if 'author' not in author_df.columns or 'processed_text' not in author_df.columns:
+            st.error(f"FATAL ERROR: '{AUTHOR_DB_FILE}' is missing required columns ('author', 'processed_text').")
+            print(f"FATAL ERROR: Missing columns in {AUTHOR_DB_FILE}.")
+            st.stop()
+        print(f"Loaded author_df with shape: {author_df.shape}")
+        loaded_data['author_df'] = author_df
+        loaded_data['paper_embeddings'] = paper_embeddings
+    except Exception as e:
+        st.error(f"Error loading base data files ({AUTHOR_DB_FILE}, {EMBEDDINGS_FILE}): {e}")
+        print(f"FATAL ERROR loading base data: {e}")
         st.stop()
 
-    # Load Sentence Transformer (from local cache)
+    # --- Load other models ---
     try:
-        # Check if cache folder exists before loading
-        if os.path.isdir('./model_cache'):
-             model = SentenceTransformer('./model_cache')
+        loaded_data['tfidf_vectorizer'] = joblib.load(TFIDF_VEC_FILE)
+        loaded_data['tfidf_matrix'] = joblib.load(TFIDF_MAT_FILE)
+        loaded_data['lda_count_vectorizer'] = joblib.load(LDA_COUNT_VEC_FILE)
+        loaded_data['lda_model'] = joblib.load(LDA_MODEL_FILE)
+        loaded_data['lda_author_profiles'] = joblib.load(LDA_PROFILES_FILE)
+    except Exception as e:
+        st.error(f"Error loading '.joblib' model files: {e}")
+        print(f"FATAL ERROR loading joblib files: {e}")
+        st.stop()
+
+    # --- Load Sentence Transformer ---
+    try:
+        if os.path.isdir(ST_MODEL_CACHE_DIR):
+             loaded_data['model'] = SentenceTransformer(ST_MODEL_CACHE_DIR)
         else:
-             # Fallback to downloading if cache doesn't exist (useful for first run)
-             print("Local model cache not found. Downloading SentenceTransformer model...")
-             model = SentenceTransformer('all-MiniLM-L6-v2')
-             model.save('./model_cache') # Save it for next time
+             print("Local model cache not found. Downloading/loading SentenceTransformer model...")
+             loaded_data['model'] = SentenceTransformer('all-MiniLM-L6-v2')
+             # Note: Saving might fail in restricted environments like Streamlit Cloud,
+             # but it will still load for the current session.
+             # try: loaded_data['model'].save(ST_MODEL_CACHE_DIR)
+             # except Exception: print("Could not save ST model cache.")
     except Exception as e:
         st.error(f"Error loading Sentence Transformer model: {e}")
-        print(f"FATAL ERROR: Could not load Sentence Transformer model: {e}")
+        print(f"FATAL ERROR loading Sentence Transformer: {e}")
         st.stop()
 
-
-    # Load LDA components
-    try:
-        lda_count_vectorizer = joblib.load('lda_count_vectorizer.joblib')
-        lda_model = joblib.load('lda_model.joblib')
-        lda_author_profiles = joblib.load('lda_author_profiles.joblib')
-    except FileNotFoundError as e:
-        st.error(f"Error loading LDA models ({e}). Make sure LDA '.joblib' files are present.")
-        print(f"FATAL ERROR: Could not load LDA model files: {e}")
-        st.stop()
-
-
-    # Build Reviewer-Reviewer Similarity Model
+    # --- Build Reviewer-Reviewer Similarity Model ---
     print("Building reviewer similarity matrix...")
-    valid_indices = [i for i, emb in enumerate(paper_embeddings) if author_df.iloc[i]['author'] is not None] # Ensure author exists
-    author_vectors_df = (
-        pd.DataFrame(paper_embeddings[valid_indices])
-        .set_index(author_df.iloc[valid_indices]['author'])
-        .groupby(level=0)
-        .mean()
-    )
-    # Filter out any potential rows with NaN embeddings if preprocessing failed unexpectedly
-    author_vectors_df = author_vectors_df.dropna()
+    try:
+        # Use the already loaded author_df
+        temp_author_df = loaded_data['author_df']
+        temp_embeddings = loaded_data['paper_embeddings']
 
-    if author_vectors_df.empty:
-         st.error("Could not build author similarity profiles. Check data quality.")
-         print("FATAL ERROR: Author vectors DataFrame is empty after processing.")
-         author_sim_df = pd.DataFrame() # Create empty DF to avoid crashing later
-    else:
+        # Ensure consistent lengths if any PDFs failed extraction earlier
+        min_len = min(len(temp_author_df), len(temp_embeddings))
+        temp_author_df = temp_author_df.iloc[:min_len]
+        temp_embeddings = temp_embeddings[:min_len]
+
+        valid_indices = temp_author_df[temp_author_df['author'].notna()].index
+        if len(valid_indices) == 0:
+             raise ValueError("No valid authors found in DataFrame for similarity calculation.")
+
+        author_vectors_df = (
+            pd.DataFrame(temp_embeddings[valid_indices])
+            .set_index(temp_author_df.loc[valid_indices, 'author'])
+            .groupby(level=0)
+            .mean()
+        ).dropna() # Drop rows if averaging resulted in NaN
+
+        if author_vectors_df.empty:
+             raise ValueError("Author vectors DataFrame is empty after processing.")
+
         author_similarity_matrix = cosine_similarity(author_vectors_df)
         author_sim_df = pd.DataFrame(
             author_similarity_matrix,
             index=author_vectors_df.index,
             columns=author_vectors_df.index
         )
+        loaded_data['author_sim_df'] = author_sim_df
+        print("Reviewer similarity matrix built successfully.")
+    except Exception as e:
+        st.warning(f"Could not build author similarity matrix: {e}. 'Find Similar Reviewers' will be disabled.")
+        print(f"ERROR building similarity matrix: {e}")
+        loaded_data['author_sim_df'] = pd.DataFrame() # Use empty DF
+
 
     print("All models loaded!")
-    return (author_df, paper_embeddings,
-            tfidf_vectorizer, tfidf_matrix,
-            model,
-            lda_count_vectorizer, lda_model, lda_author_profiles,
-            author_sim_df)
+    return loaded_data # Return a dictionary
 
 # --- Load all models ---
 st.write("Loading all models...")
-(author_df, paper_embeddings,
- tfidf_vectorizer, tfidf_matrix,
- model,
- lda_count_vectorizer, lda_model, lda_author_profiles,
- author_sim_df) = load_models_and_data()
-st.success("All models loaded! ✅")
+# Unpack the dictionary
+loaded_models_data = load_models_and_data()
+author_df = loaded_models_data.get('author_df', pd.DataFrame()) # Default to empty if load failed
+paper_embeddings = loaded_models_data.get('paper_embeddings', np.array([]))
+tfidf_vectorizer = loaded_models_data.get('tfidf_vectorizer')
+tfidf_matrix = loaded_models_data.get('tfidf_matrix')
+model = loaded_models_data.get('model')
+lda_count_vectorizer = loaded_models_data.get('lda_count_vectorizer')
+lda_model = loaded_models_data.get('lda_model')
+lda_author_profiles = loaded_models_data.get('lda_author_profiles')
+author_sim_df = loaded_models_data.get('author_sim_df', pd.DataFrame())
+
+# Check again if author_df is truly loaded
+if author_df.empty:
+    st.error("App initialization failed: Author database is empty after loading attempt.")
+    st.stop()
+else:
+    st.success("All models loaded! ✅")
+
 
 # -----------------------------------------------------------------
-# 3. RECOMMENDATION FUNCTIONS (Includes LDA)
+# 3. RECOMMENDATION FUNCTIONS (Added safety checks)
 # -----------------------------------------------------------------
 
 def recommend_with_tfidf(processed_input, k=5):
-    if not processed_input: return pd.Series(dtype='float64') # Handle empty input
-    input_vector = tfidf_vectorizer.transform([processed_input])
-    similarities = cosine_similarity(input_vector, tfidf_matrix).flatten()
-    # Create a temporary df to avoid modifying global state if running concurrently
-    temp_df = pd.DataFrame({'author': author_df['author'], 'similarity_score': similarities})
-    top_authors = temp_df.groupby('author')['similarity_score'].max().sort_values(ascending=False)
-    return top_authors.head(k)
+    if not processed_input or tfidf_vectorizer is None or tfidf_matrix is None: return pd.Series(dtype='float64')
+    try:
+        input_vector = tfidf_vectorizer.transform([processed_input])
+        similarities = cosine_similarity(input_vector, tfidf_matrix).flatten()
+        temp_df = pd.DataFrame({'author': author_df['author'], 'similarity_score': similarities})
+        top_authors = temp_df.groupby('author')['similarity_score'].max().sort_values(ascending=False)
+        return top_authors.head(k)
+    except Exception as e:
+        print(f"Error in recommend_with_tfidf: {e}")
+        return pd.Series(dtype='float64')
 
 def recommend_with_embeddings(processed_input, k=5):
-    if not processed_input: return pd.Series(dtype='float64') # Handle empty input
-    input_embedding = model.encode([processed_input])
-    # Ensure paper_embeddings is 2D
-    embeddings_matrix = paper_embeddings if paper_embeddings.ndim == 2 else paper_embeddings.reshape(-1, 1) # Reshape if needed, adjust dimensions as per your model output
-    if input_embedding.shape[1] != embeddings_matrix.shape[1]:
-         print(f"ERROR: Embedding dimension mismatch. Input: {input_embedding.shape}, Database: {embeddings_matrix.shape}")
-         return pd.Series(dtype='float64')
-    similarities = cosine_similarity(input_embedding, embeddings_matrix).flatten()
-    temp_df = pd.DataFrame({'author': author_df['author'], 'similarity_score': similarities})
-    top_authors = temp_df.groupby('author')['similarity_score'].max().sort_values(ascending=False)
-    return top_authors.head(k)
+    if not processed_input or model is None or paper_embeddings.size == 0: return pd.Series(dtype='float64')
+    try:
+        input_embedding = model.encode([processed_input])
+        embeddings_matrix = paper_embeddings # Already loaded as numpy array
+        # Ensure dimensions match before similarity calculation
+        if input_embedding.shape[1] != embeddings_matrix.shape[1]:
+            print(f"ERROR: Embedding dimension mismatch. Input: {input_embedding.shape}, DB: {embeddings_matrix.shape}")
+            return pd.Series(dtype='float64')
+        similarities = cosine_similarity(input_embedding, embeddings_matrix).flatten()
+         # Ensure author_df and similarities align
+        temp_df = pd.DataFrame({'author': author_df.iloc[:len(similarities)]['author'], 'similarity_score': similarities}) # Use iloc[:len] for safety
+        top_authors = temp_df.groupby('author')['similarity_score'].max().sort_values(ascending=False)
+
+        return top_authors.head(k)
+    except Exception as e:
+        print(f"Error in recommend_with_embeddings: {e}")
+        return pd.Series(dtype='float64')
 
 def recommend_with_lda(processed_input, k=5):
-    if not processed_input: return pd.Series(dtype='float64') # Handle empty input
+    if not processed_input or lda_count_vectorizer is None or lda_model is None or lda_author_profiles is None or lda_author_profiles.empty: return pd.Series(dtype='float64')
     try:
         input_count_vector = lda_count_vectorizer.transform([processed_input])
         input_topic_distribution = lda_model.transform(input_count_vector)
-        # Ensure author profiles are valid before calculating similarity
-        if lda_author_profiles.empty:
-             print("ERROR: LDA Author profiles are empty.")
-             return pd.Series(dtype='float64')
         similarities = cosine_similarity(input_topic_distribution, lda_author_profiles.values).flatten()
         author_scores = pd.Series(similarities, index=lda_author_profiles.index)
         top_authors = author_scores.sort_values(ascending=False)
         return top_authors.head(k)
     except Exception as e:
-        print(f"Error during LDA recommendation: {e}")
+        print(f"Error in recommend_with_lda: {e}")
         return pd.Series(dtype='float64')
 
 
 def get_similar_reviewers(author_name, k=5):
-    # Check if author_sim_df is valid
     if author_sim_df.empty or author_name not in author_sim_df:
-        print(f"Author '{author_name}' not found in similarity matrix or matrix is empty.")
+        print(f"Author '{author_name}' not found or similarity matrix empty.")
         return pd.Series(dtype='float64')
-    similar_scores = author_sim_df[author_name]
-    top_similar = similar_scores.sort_values(ascending=False).drop(author_name)
-    return top_similar.head(k)
+    try:
+        similar_scores = author_sim_df[author_name]
+        top_similar = similar_scores.sort_values(ascending=False).drop(author_name)
+        return top_similar.head(k)
+    except Exception as e:
+        print(f"Error in get_similar_reviewers for {author_name}: {e}")
+        return pd.Series(dtype='float64')
 
 # -----------------------------------------------------------------
-# 4. UI: PAPER RECOMMENDATION (Includes LDA and Filtering)
+# 4. UI: PAPER RECOMMENDATION (More detailed error messages)
 # -----------------------------------------------------------------
 
 st.title("👨‍🎓 Research Paper Reviewer Recommendation System")
@@ -268,90 +311,95 @@ st.write("Upload a PDF to find the best expert reviewers.")
 if 'k_value' not in st.session_state: st.session_state.k_value = 5
 if 'file_bytes' not in st.session_state: st.session_state.file_bytes = None
 if 'file_name' not in st.session_state: st.session_state.file_name = ""
-if 'results' not in st.session_state: st.session_state.results = None # Holds 3 results
+if 'results' not in st.session_state: st.session_state.results = None
+if 'last_uploaded_filename' not in st.session_state: st.session_state.last_uploaded_filename = "" # Initialize
 
 uploaded_file = st.file_uploader("Upload your research paper (PDF)", type=["pdf"])
 st.number_input("Number of reviewers to recommend (k):", min_value=3, max_value=20, key='k_value')
 run_button = st.button("Find Reviewers for Paper")
 
+# Handle file upload change
 if uploaded_file is not None:
-    # If a new file is uploaded, store it and clear old results
-    if uploaded_file.name != st.session_state.get('last_uploaded_filename', ''):
+    if uploaded_file.name != st.session_state.last_uploaded_filename:
         st.session_state.file_bytes = uploaded_file.getvalue()
         st.session_state.file_name = uploaded_file.name
-        st.session_state.results = None
-        st.session_state.last_uploaded_filename = uploaded_file.name # Track the last file
+        st.session_state.results = None # Clear results for new file
+        st.session_state.last_uploaded_filename = uploaded_file.name
         st.info(f"Loaded: **{st.session_state.file_name}**")
-    else:
-        # Keep existing file if the uploader widget re-runs without a new file selection
-        pass
-
 
 if run_button:
     if st.session_state.file_bytes is not None:
         with st.spinner("Processing paper and finding reviewers..."):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                tmp_file.write(st.session_state.file_bytes)
-                tmp_file_path = tmp_file.name
+            tmp_file_path = None # Define outside try block
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                    tmp_file.write(st.session_state.file_bytes)
+                    tmp_file_path = tmp_file.name
 
-            input_text = extract_text_from_pdf(tmp_file_path)
+                print(f"Processing temporary file: {tmp_file_path}")
+                input_text = extract_text_from_pdf(tmp_file_path)
 
-            if not input_text:
-                 st.error(f"Could not extract text from the uploaded PDF: {st.session_state.file_name}. It might be empty, encrypted, corrupted, or purely image-based with OCR failing. Please try another file.")
-                 st.session_state.results = None
-                 if os.path.exists(tmp_file_path): os.remove(tmp_file_path)
+                if not input_text:
+                     st.error(f"Could not extract any text from the uploaded PDF: '{st.session_state.file_name}'. Possible reasons: empty file, severe corruption, encryption, or OCR failure. Please verify the file or try another.")
+                     st.session_state.results = None
 
-            else:
-                processed_input = preprocess_text(input_text)
-
-                # Check if processed input is empty after cleaning
-                if not processed_input:
-                     st.warning(f"Could not extract meaningful text content (after cleaning) from: {st.session_state.file_name}. Recommendations might be inaccurate.")
-                     # Set empty results if no text
-                     st.session_state.results = (pd.Series(dtype='float64'), pd.Series(dtype='float64'), pd.Series(dtype='float64'))
                 else:
-                    k = st.session_state.k_value
-                    # Get Raw Recommendations (k+1 for filtering)
-                    tfidf_recs_raw = recommend_with_tfidf(processed_input, k=k+5) # Get more for robust filtering
-                    embedding_recs_raw = recommend_with_embeddings(processed_input, k=k+5)
-                    lda_recs_raw = recommend_with_lda(processed_input, k=k+5)
+                    processed_input = preprocess_text(input_text)
+                    print(f"Length of processed text: {len(processed_input)}")
 
-                    # Filter out original author
-                    uploaded_filename = st.session_state.file_name
-                    matching_paper = author_df[author_df['paper'] == uploaded_filename]
-                    author_to_exclude = None
-                    if not matching_paper.empty:
-                        author_to_exclude = matching_paper.iloc[0]['author']
-
-                    if author_to_exclude:
-                        print(f"Excluding author: {author_to_exclude}")
-                        tfidf_recs = tfidf_recs_raw[tfidf_recs_raw.index != author_to_exclude].head(k)
-                        embedding_recs = embedding_recs_raw[embedding_recs_raw.index != author_to_exclude].head(k)
-                        lda_recs = lda_recs_raw[lda_recs_raw.index != author_to_exclude].head(k)
+                    if not processed_input:
+                         st.warning(f"Extracted text from '{st.session_state.file_name}' became empty after cleaning (removing punctuation, numbers, stopwords). Recommendations might be unreliable or impossible.")
+                         st.session_state.results = (pd.Series(dtype='float64'), pd.Series(dtype='float64'), pd.Series(dtype='float64'))
                     else:
-                        tfidf_recs = tfidf_recs_raw.head(k)
-                        embedding_recs = embedding_recs_raw.head(k)
-                        lda_recs = lda_recs_raw.head(k)
+                        k = st.session_state.k_value
+                        tfidf_recs_raw = recommend_with_tfidf(processed_input, k=k+5)
+                        embedding_recs_raw = recommend_with_embeddings(processed_input, k=k+5)
+                        lda_recs_raw = recommend_with_lda(processed_input, k=k+5)
 
-                    # Store results
-                    st.session_state.results = (tfidf_recs, embedding_recs, lda_recs)
+                        # Filter out original author
+                        uploaded_filename = st.session_state.file_name
+                        author_to_exclude = None
+                        # Check author_df is not empty before filtering
+                        if not author_df.empty:
+                            matching_paper = author_df[author_df['paper'] == uploaded_filename]
+                            if not matching_paper.empty:
+                                author_to_exclude = matching_paper.iloc[0]['author']
 
-                # Cleanup temp file regardless of outcome
-                if os.path.exists(tmp_file_path): os.remove(tmp_file_path)
+                        if author_to_exclude:
+                            print(f"Excluding author: {author_to_exclude}")
+                            tfidf_recs = tfidf_recs_raw[tfidf_recs_raw.index != author_to_exclude].head(k)
+                            embedding_recs = embedding_recs_raw[embedding_recs_raw.index != author_to_exclude].head(k)
+                            lda_recs = lda_recs_raw[lda_recs_raw.index != author_to_exclude].head(k)
+                        else:
+                            tfidf_recs = tfidf_recs_raw.head(k)
+                            embedding_recs = embedding_recs_raw.head(k)
+                            lda_recs = lda_recs_raw.head(k)
+
+                        st.session_state.results = (tfidf_recs, embedding_recs, lda_recs)
+
+            # Ensure cleanup happens even if errors occurred
+            finally:
+                if tmp_file_path and os.path.exists(tmp_file_path):
+                    try:
+                        os.remove(tmp_file_path)
+                        print(f"Removed temporary file: {tmp_file_path}")
+                    except Exception as e_clean:
+                        print(f"Error removing temp file {tmp_file_path}: {e_clean}")
+
 
     elif st.session_state.file_bytes is None:
         st.error("Please upload a PDF file first.")
 
 
-# Display results if they exist
+# Display results
 if st.session_state.results is not None:
     tfidf_recs, embedding_recs, lda_recs = st.session_state.results
 
-    # Check if any recommendations were actually generated
     if tfidf_recs.empty and embedding_recs.empty and lda_recs.empty and st.session_state.file_name:
-         # This happens if processed_input was empty or models failed
-         st.warning(f"No recommendations could be generated for {st.session_state.file_name}. This might happen if the PDF content was too short or unprocessable after cleaning.")
-    elif st.session_state.file_name: # Only show results section if a file was processed
+         # Check if this state was reached due to empty processed text
+         # (We already showed a warning if processed_input was empty)
+         pass # Avoid showing redundant message if warning was already displayed
+    elif st.session_state.file_name:
         st.success("Analysis complete!")
         st.subheader(f"Top {st.session_state.k_value} Recommended Reviewers for: **{st.session_state.file_name}**")
 
@@ -375,37 +423,49 @@ if st.session_state.results is not None:
             """)
 
 # -----------------------------------------------------------------
-# 5. UI: REVIEWER-REVIEWER SIMILARITY (Error handling added)
+# 5. UI: REVIEWER-REVIEWER SIMILARITY (Improved checks)
 # -----------------------------------------------------------------
 st.markdown("---")
 st.header("🤝 Find Similar Reviewers")
 st.write("Select an author to find others with similar overall expertise.")
 
-# Make sure author_df is loaded before accessing it
-if 'author_df' in locals() and not author_df.empty:
-    all_authors = sorted(author_df['author'].unique())
+# Use the globally loaded author_df, check if it's valid and has authors
+if not author_df.empty and 'author' in author_df.columns:
+    all_authors = sorted(list(author_df['author'].dropna().unique())) # Drop NaNs and get unique
     if "Unknown_Author" in all_authors:
-         all_authors.remove("Unknown_Author") # Remove placeholder if used
+         all_authors.remove("Unknown_Author")
 
     if not all_authors:
-        st.warning("No authors found in the database to select from.")
+        st.warning("No valid author names found in the database to select from.")
     else:
-        selected_author = st.selectbox("Select an author:", all_authors, key="similar_author_select") # Added key
+        selected_author = st.selectbox(
+            "Select an author:",
+            all_authors,
+            key="similar_author_select",
+            # Add placeholder text if no author is selected yet
+            index=None if not hasattr(st.session_state, 'similar_author_select') else all_authors.index(st.session_state.similar_author_select) if st.session_state.similar_author_select in all_authors else None,
+            placeholder="Choose an author..."
+        )
 
-        if st.button(f"Find Reviewers Similar to {selected_author}"):
-            if selected_author:
-                with st.spinner(f"Analyzing authors similar to {selected_author}..."):
-                    similar_authors = get_similar_reviewers(selected_author, k=5)
-                    if similar_authors.empty:
-                        st.warning(f"Could not find similar reviewers for {selected_author}. The author might not be in the similarity matrix or the matrix is empty.")
-                    else:
-                        st.subheader(f"Top 5 Reviewers with Similar Expertise:")
-                        st.dataframe(pd.DataFrame({
-                            'Author': similar_authors.index,
-                            'Similarity Score': similar_authors.values
-                        }))
+
+        if st.button(f"Find Reviewers Similar to Selected Author"):
+            if selected_author: # Check if an author was actually selected
+                # Also check if author_sim_df was successfully created
+                if author_sim_df.empty:
+                     st.error("Reviewer similarity matrix could not be built during startup. This feature is unavailable.")
+                else:
+                    with st.spinner(f"Analyzing authors similar to {selected_author}..."):
+                        similar_authors = get_similar_reviewers(selected_author, k=5)
+                        if similar_authors.empty:
+                            st.warning(f"Could not find similar reviewers for {selected_author}.")
+                        else:
+                            st.subheader(f"Top 5 Reviewers with Similar Expertise:")
+                            st.dataframe(pd.DataFrame({
+                                'Author': similar_authors.index,
+                                'Similarity Score': similar_authors.values
+                            }))
             else:
-                st.warning("Please select an author.")
+                st.warning("Please select an author from the dropdown first.")
 else:
-
-    st.error("Author data could not be loaded. Cannot display reviewer similarity section.")
+    # This message shows if author_df failed to load at the very beginning
+    st.error("Author data is unavailable. Cannot display the 'Find Similar Reviewers' section.")
