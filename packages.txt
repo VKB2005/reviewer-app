@@ -1,6 +1,3 @@
-# For Poppler (needed by pdf2image)
 poppler-utils
-# For Tesseract OCR
 tesseract-ocr
-# Tesseract language data for English
 tesseract-ocr-eng
