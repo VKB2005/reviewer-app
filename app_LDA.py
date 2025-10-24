@@ -30,25 +30,34 @@ import tempfile
 #     pass
 
 # Use the simplified Poppler path
-poppler_install_path = r"C:\poppler\bin" # Path to the bin folder
+poppler_install_path = r"C:\Users\VAMSHI KRISHNA BABU\poppler\poppler-25.07.0\Library\bin"
 
+# --- NLTK Setup ---
 # --- NLTK Setup ---
 @st.cache_data
 def setup_nltk():
     try:
+        # Check if resources exist, raise LookupError if not
         nltk.data.find('corpora/stopwords')
-    except nltk.downloader.DownloadError:
+        print("NLTK stopwords found.")
+    except LookupError:
+        print("NLTK stopwords not found. Downloading...")
         nltk.download('stopwords', quiet=True)
     try:
         nltk.data.find('tokenizers/punkt')
-    except nltk.downloader.DownloadError:
+        print("NLTK punkt tokenizer found.")
+    except LookupError:
+        print("NLTK punkt tokenizer not found. Downloading...")
         nltk.download('punkt', quiet=True)
     try:
-        nltk.data.find('tokenizers/punkt_tab') # Might be needed by word_tokenize indirectly
-    except nltk.downloader.DownloadError:
-         nltk.download('punkt_tab', quiet=True) # Added this download
-setup_nltk()
+        # This resource might be needed by word_tokenize indirectly
+        nltk.data.find('tokenizers/punkt_tab')
+        print("NLTK punkt_tab resource found.")
+    except LookupError:
+        print("NLTK punkt_tab resource not found. Downloading...")
+        nltk.download('punkt_tab', quiet=True) # Added this download
 
+setup_nltk()
 
 # --- PDF Extraction & Preprocessing (No Tika) ---
 def extract_text_from_pdf(pdf_path):
@@ -398,4 +407,5 @@ if 'author_df' in locals() and not author_df.empty:
             else:
                 st.warning("Please select an author.")
 else:
+
     st.error("Author data could not be loaded. Cannot display reviewer similarity section.")
