@@ -23,8 +23,7 @@ import tempfile
 # --- Setup Tesseract & Poppler Paths ---
 # (We still need these for processing NEWLY UPLOADED files)
 
-tesseract_install_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-pytesseract.pytesseract.tesseract_cmd = tesseract_install_path
+
 poppler_install_path = r"C:\Users\VAMSHI KRISHNA BABU\poppler\poppler-25.07.0\Library\bin"
 
 # --- NLTK Setup ---
@@ -205,3 +204,4 @@ if st.button(f"Find Reviewers Similar to {selected_author}"):
             'Similarity Score': similar_authors.values
 
         }))
+
