@@ -1,0 +1,12 @@
+pandas
+scikit-learn
+PyMuPDF
+nltk
+sentence-transformers
+tqdm
+pytesseract
+pdf2image
+streamlit
+joblib
+pyarrow
+tf-keras
