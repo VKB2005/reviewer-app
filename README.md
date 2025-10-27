@@ -39,7 +39,7 @@ To design and build a system that accepts a research paper (PDF) as input and re
 
 This application is deployed and publicly accessible via Streamlit Community Cloud:
 
-**➡️ [Access the Live App Here](https://your-app-name.streamlit.app/)** ⬅️
+**➡️ [Access the Live App Here](https://reviewer-app-vkb2005.streamlit.app/)** ⬅️
 *(Replace this link with your actual Streamlit Cloud URL)*
 
 No installation is required to use the deployed app. Just visit the link above.
